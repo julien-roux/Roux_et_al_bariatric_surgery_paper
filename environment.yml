@@ -1,0 +1,59 @@
+name: Roux_et_al_bariatric_surgery_paper
+channels:
+ - conda-forge
+ - bioconda
+dependencies:
+ - r-base = 4.3.1 
+ - bioconductor-affy = 1.80.0
+ - bioconductor-annotate = 1.80.0
+ - bioconductor-AnnotationHub = 3.10.0
+ - r-BiocManager = 1.30.22
+ - r-circlize = 0.4.15
+ - r-cluster = 2.1.4
+ - r-coda = 0.19-4
+ - bioconductor-ComplexHeatmap = 2.18.0
+ - bioconductor-decoupleR = 2.8.0
+ - r-devtools = 2.4.5
+ - r-doParallel = 1.0.17
+ - bioconductor-edgeR = 4.0.2
+ - bioconductor-ensembldb = 2.26.0
+ - bioconductor-GEOquery = 2.70.0
+ - r-ggalluvial = 0.12.5
+ - r-ggExtra = 0.10.1
+ - r-ggnetwork = 0.5.13
+ - r-ggplot2 = 3.5.1
+ - r-ggpubr = 0.6.0
+ - r-ggraph = 2.1.0
+ - r-ggrepel = 0.9.4
+ - r-GlobalOptions = 0.1.2
+ - bioconductor-GO.db = 3.18.0
+ - bioconductor-graph = 1.80.0
+ - r-gridBase = 0.4-7
+ - bioconductor-GSEABase = 1.64.0
+ - bioconductor-GSVA = 1.50.0
+ - bioconductor-HDF5Array = 1.30.0
+ - bioconductor-hgu133plus2.db = 3.13.0
+ - r-igraph = 1.5.1
+ - bioconductor-illuminaHumanv2.db = 1.26.0
+ - bioconductor-illuminaHumanv3.db = 1.26.0
+ - bioconductor-limma = 3.58.1
+ - r-network = 1.18.2
+ - r-NMF = 0.21
+ - bioconductor-org.Hs.eg.db = 3.18.0
+ - r-patchwork = 1.1.3
+ - r-pbapply = 1.7-2
+ - r-pracma = 2.4.4
+ - r-registry = 0.5-1
+ - r-reticulate = 1.34.0
+ - bioconductor-rhdf5 = 2.46.1
+ - bioconductor-rhdf5filters = 1.14.1
+ - bioconductor-Rhdf5lib = 1.24.0
+ - r-rngtools = 1.5.2
+ - r-RSpectra = 0.16-1
+ - r-RSQLite = 2.3.3
+ - bioconductor-scater = 1.30.1
+ - bioconductor-SingleCellExperiment = 1.24.0
+ - r-sna = 2.8
+ - r-statnet.common = 4.9.0
+ - r-svglite = 2.1.2
+ - r-tidyverse = 2.0.0

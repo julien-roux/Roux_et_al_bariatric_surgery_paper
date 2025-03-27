@@ -1,0 +1,1565 @@
+---
+title: "Roux_et_al_bariatric_surgery_paper"
+author: "Julien Roux"
+date: "2025-03-07"
+output: 
+  html_document:
+    fig_height: 5
+    fig_width: 6
+    theme: spacelab
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(echo = TRUE, 
+               cache.extra = rand_seed)
+```
+
+# Introduction
+
+This script reproduces the differential expression analysis and additional analyses presented in the Roux et al. 2025 paper
+
+Due to patient privacy concerns patient metadata (used for Figure 1 and S1) and raw sequencing data cannot be shared publicly. The analysis code below starts from the read count matrix and associated sample and gene info files available from GEO (https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE273902)
+
+# Load libraries
+```{r libs, warning=FALSE, message=FALSE}
+library(tidyverse)
+
+## Gene annotation
+library(ensembldb)
+library(AnnotationHub)
+library(org.Hs.eg.db)
+library(RSQLite)
+
+## PCA
+library(SingleCellExperiment)
+library(scater)
+
+## Differential expression
+library(limma)
+library(edgeR)
+
+## GSEA
+library(GO.db)
+library(igraph)
+library(ggraph)
+
+## TF activity 
+library(decoupleR)
+
+## Ligands/receptors
+library(CellChat) 
+
+## Differential abundance
+library(xCell)
+
+## Comparison to external datasets
+library(GEOquery)
+library(affy)
+library(illuminaHumanv2.db)
+library(illuminaHumanv3.db)
+library(hgu133plus2.db)
+
+## Plotting
+library(ggplot2)
+library(ggExtra)
+library(ggrepel)
+library(ggpubr)
+myTheme <- theme_bw(base_size = 20) +
+  theme(panel.grid.major = element_line(colour = "lightgrey", linewidth = 0.2), 
+        panel.grid.minor = element_line(colour = "lightgrey", linewidth = 0.05),
+        legend.position="right", legend.direction = "vertical",
+        legend.text=element_text(size=10),
+        axis.title=element_text(size=20), 
+        axis.text=element_text(size=10), 
+        panel.spacing.x = unit(1.2, "lines"))
+myPalette <-  c('#e6194b', '#4363d8', '#3cb44b', '#984EA3', '#f58231', '#ffe119', '#F781BF', '#808080', '#98BFDB', '#bcf60c', '#008080', '#e6beff', '#E5C494', '#000075', '#CD00CD', '#aaffc3', '#808000', '#9a6324', '#fffac8', '#800000', '#000000', '#ffffff')
+
+# Useful for downloads
+options(timeout=300)
+
+## Exact versions of packages used for the paper: this slightly differs from the versions in the conda environment
+# library(devtools)
+# saveRDS(devtools::session_info(), "session_info.rds")
+
+## To knit the document as HTML
+# rmarkdown::render("Roux_et_al_bariatric_surgery_paper.Rmd")
+```
+
+# Read-in and subset data
+
+```{r readin}
+## Matrix of read counts
+tab <- read.table(file = "data/GSE273902_Counts_Table.tsv.gz", sep = "\t", h=T)
+
+## Info on samples
+metadata <- read.table(file = "data/GSE273902_Sample_Info.tsv.gz", sep = "\t", h=T, quote = "")
+metadata$Sample <- row.names(metadata)
+
+## Info on genes
+genes <- read.table(file = "data/GSE273902_Gene_Info.tsv.gz", sep = "\t", h=T, quote = "")
+row.names(genes) <- genes$GENEID
+
+## Build DGEList object
+dge <- DGEList(counts = tab, 
+               samples = metadata, 
+               genes = genes)
+
+## If additional information is needed for the genes, it can be retrieved with EnsemblDB, for example
+ah <- AnnotationHub()
+ahDb <- query(ah, paste("Ensembl 102 EnsDb for Homo sapiens"))
+edb <- ahDb[[1]]
+# dge$genes$SYMBOL <- mapIds(edb, key=dge$genes$GENEID, keytype="GENEID", column="SYMBOL", multiVals = "first")
+
+## Calculate size factors
+dge <- calcNormFactors(dge) 
+
+## Filter DGEList to keep paired samples (visits 1 and 4)
+patient_to_keep <- names(which(rowSums(table(dge$samples$Patient, dge$samples$Visit)[, c("V1", "V4")] != 0) == 2))
+sample_to_keep <- dge$samples$Visit %in% c("V1", "V4") & dge$samples$Patient %in% patient_to_keep
+dge.subset <- dge[, sample_to_keep]
+
+## Clean-up samples variables
+dge.subset$samples$Patient <- factor(dge.subset$samples$Patient)
+dge.subset$samples$Visit <- factor(dge.subset$samples$Visit)
+table(dge.subset$samples$Visit)
+dge.subset$samples$Sex <- factor(dge.subset$samples$Sex)
+table(dge.subset$samples$Sex)
+dge.subset$samples$Patient.subgroup <- factor(dge.subset$samples$Patient.subgroup)
+table(dge.subset$samples$Patient.subgroup)
+dge.subset$samples$Surgery.type <- factor(dge.subset$samples$Surgery.type)
+## Simplify variable by pooling "gastric band" and "revision"
+levels(dge.subset$samples$Surgery.type) <- c("other", "gastric bypass", "gastric sleeve", "other")
+## Reorder
+dge.subset$samples$Surgery.type <- factor(dge.subset$samples$Surgery.type, levels=levels(dge.subset$samples$Surgery.type)[c(2,3,1)])
+table(dge.subset$samples$Surgery.type)
+
+
+## Filter genes that are lowly expressed 
+keep <- rowSums(edgeR::cpm(dge.subset) > 1) >= 12 ## 1/4 of the samples
+## Filter some gene biotypes, mostly pseudogenes
+keep <- keep & (!dge.subset$genes$GENEBIOTYPE %in% c("pseudogene", "processed_pseudogene", "IG_C_pseudogene", 
+                                                     "IG_D_pseudogene", "IG_pseudogene", "IG_V_pseudogene", "IG_J_pseudogene",
+                                                     "TR_J_pseudogene", "TR_V_pseudogene", "transcribed_processed_pseudogene", 
+                                                     "transcribed_unitary_pseudogene", "transcribed_unprocessed_pseudogene", 
+                                                     "translated_processed_pseudogene", "translated_unprocessed_pseudogene", 
+                                                     "unitary_pseudogene", "rRNA_pseudogene", 
+                                                     "unprocessed_pseudogene", "polymorphic_pseudogene", "TEC") &
+                  !is.na(dge.subset$genes$GENEBIOTYPE))
+sum(keep) 
+
+## Subset, while updating total counts
+dge.subset <- dge.subset[keep, , keep.lib.sizes=FALSE]
+## Redo TMM normalization
+dge.subset <- calcNormFactors(dge.subset)
+
+## Calculate CPMs
+log2cpm.loess <- normalizeBetweenArrays(edgeR::cpm(dge.subset, log=TRUE, prior.count=8, normalized.lib.sizes=TRUE), method = "cyclicloess")
+plotDensities(log2cpm.loess, group=dge.subset$samples$groupSimple, col=myPalette, legend = FALSE)
+```
+
+# Figure 2
+Principal component analysis
+
+```{r PCA, fig.width=8, fig.height=8}
+## Perform PCA on the 500 genes with largest inter-quartile range
+iqrs <- apply(log2cpm.loess, 1, IQR)
+sel <- iqrs >= sort(iqrs, decreasing = T)[500]
+pca1 <- prcomp(t(log2cpm.loess[sel,]), scale = T)
+## Variance explained by top PCs
+summary(pca1)$importance[, 1:10]
+
+## Plotting
+myDf <- cbind(pca1$x, dge.subset$samples)
+f2p1 <- ggplot(myDf, aes(x=PC1, y=PC2, color=Visit, shape=Surgery.type)) +
+  geom_point(size=4) +
+  xlab(paste("PC1 (", round(summary(pca1)$importance[2,1],3)*100, "% variance)", sep="")) +
+  ylab(paste("PC2 (", round(summary(pca1)$importance[2,2],3)*100, "% variance)", sep="")) +
+  scale_color_manual(labels=c("Visit 1", "Visit 4"), values=myPalette[c(2,1)]) + ## v4 = red (up in DE analysis)
+  scale_shape_manual(values=c(15:17)) + 
+  myTheme +
+  theme(legend.position="bottom")
+## Figure 2A
+f2p1 <- ggMarginal(f2p1, groupColour = TRUE, groupFill = TRUE)
+plot(f2p1)
+
+
+## Other interesting plots, not shown in the paper
+## PC3 vs. 4 colored by sex
+f <- ggplot(myDf, aes(x=PC3, y=PC4, color=Sex, shape=Visit)) +
+  geom_point(size=4) +
+  xlab(paste("PC3 (", round(summary(pca1)$importance[2,3],3)*100, "% variance)", sep="")) +
+  ylab(paste("PC4 (", round(summary(pca1)$importance[2,4],3)*100, "% variance)", sep="")) +
+  scale_color_manual(values=myPalette[3:4]) +
+  scale_shape_manual(values=15:16) +
+  myTheme +
+  theme(legend.position="bottom")
+f <- ggMarginal(f, groupColour = TRUE, groupFill = TRUE)
+plot(f)
+
+
+f <- ggplot(myDf[myDf$Patient.subgroup != "Unknown", ], 
+            aes(x=PC7, y=PC9, color=Patient.subgroup, shape=Visit)) +
+  geom_point(size=4) +
+  xlab(paste("PC7 (", round(summary(pca1)$importance[2,7],3)*100, "% variance)", sep="")) +
+  ylab(paste("PC9 (", round(summary(pca1)$importance[2,9],3)*100, "% variance)", sep="")) +
+  scale_color_manual(name="Patient subgroup",
+                     values=setNames(myPalette[c(9,5,6,7,8)], c("No diabetes", "Insulin dependent T2D / No remission", "T2D / No remission", "T2D / Remission", "Unknown"))) +
+  scale_shape_manual(values=15:16) +
+  myTheme  + 
+  theme(legend.position="bottom") +
+  guides(color=guide_legend(ncol=2))
+f <- ggMarginal(f, groupColour = TRUE, groupFill = TRUE)
+plot(f)
+
+
+## Percentage of variance of each PC explained by different factors
+## Put normalized data into a SingleCellExperiment object to be used in function getExplanatoryPCs
+sce <- SingleCellExperiment(assays=list(logcounts=log2cpm.loess),
+                                                  reducedDims = list(PCA=pca1$x),
+                                                  colData=dge.subset$samples) 
+percentVar <- getExplanatoryPCs(sce, 
+                                n_dimred = 48,
+                                dimred = "PCA",
+                                variables = c("Visit", "Patient", "Sex", 
+                                              "Patient.subgroup", "Surgery.type"))
+head(percentVar, n=10)
+
+## Plotting
+myDf <- data.frame(PC = rep(seq_len(10), ncol(percentVar)), 
+                   Factor = rep(factor(colnames(percentVar), levels = c("Patient", "Visit", "Sex", "Surgery.type", "Patient.subgroup")), each = 10), 
+                   Pct_var_explained = as.numeric(percentVar[1:10, ]), 
+                   check.names = FALSE)
+f2p2 <- ggplot(myDf, aes(x = PC, y = Pct_var_explained, fill = Factor)) + 
+  geom_bar(stat="identity", width = 0.7, position=position_dodge2(padding=0.05)) + 
+  scale_fill_manual(values = myPalette[c(10, 1, 3, 13, 7)]) +
+  xlab("Principal Component") +
+  ylab("% variance explained") + 
+  coord_cartesian(ylim = c(0, 100), expand = FALSE) + 
+  scale_x_continuous(breaks = c(1:10)) +
+  myTheme + 
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(), 
+        legend.position="bottom") +
+  guides(fill=guide_legend(ncol=3))  
+## Figure 2B
+f2p2
+```
+
+# Differential expression analysis
+
+```{r DE}
+## design matrix 
+moma <- model.matrix(~ 0 + Visit + Patient, data=dge.subset$samples)
+colnames(moma) <- gsub("Visit", "", colnames(moma)) 
+
+## Contrast matrix
+contrasts.matrix <- makeContrasts(
+  Post_vs_pre = V4 - V1,
+  levels=moma
+)
+
+v <- voom(dge.subset, moma, plot=TRUE, normalize.method = "cyclicloess")
+fit <- lmFit(v, moma)
+fit2 <- contrasts.fit(fit, contrasts.matrix)
+fit2 <- eBayes(fit2, robust=TRUE) ## avoids shrinkage of large variances
+
+## Genes DE at FDR 5%
+table(de <- decideTests(fit2, p.value = 0.05))
+## Top 10 genes by significance
+topTable(fit2, coef=1, p.value=0.05, n=10, sort.by = "P")
+## Top 10 genes by logFC
+topTable(fit2, coef=1, p.value=0.05, n=10, sort.by = "logFC")
+
+## Diagnostic plots
+plotSA(fit2) 
+top <- topTable(fit2, coef=1, p.value=1, n=Inf, sort.by = "none")
+hist(top$P.Value, n=100)
+```
+
+## Build up list of ligands and receptors
+
+```{r ligand_receptor}
+## CellChatDB ##################################################################
+CellChatDB <- CellChatDB.human 
+## Extract all ligands
+cellchat_ligands <- CellChatDB$interaction |> 
+  dplyr::filter(annotation == "Secreted Signaling") |> 
+  dplyr::left_join(y = CellChatDB$geneInfo, by = join_by(ligand == Symbol)) |>
+  dplyr::select(ligand) |> 
+  distinct() |> 
+  dplyr::filter(ligand != "") |>
+  unlist()
+## Add complexes
+CellChatDB.complex <- CellChatDB$complex |> 
+  as_tibble(rownames = "Complex") |> 
+  pivot_longer(!Complex, names_to = "Subunit", values_to = "Symbol") |> 
+  dplyr::filter(Symbol != "") |> 
+  distinct()
+cellchat_ligands <- c(cellchat_ligands,
+                      CellChatDB$interaction |> 
+                        dplyr::filter(annotation == "Secreted Signaling") |> 
+                        dplyr::left_join(y = CellChatDB.complex, 
+                                  by = join_by(ligand == Complex), 
+                                  relationship = "many-to-many") |> 
+                        dplyr::filter(!is.na(Symbol)) |> 
+                        dplyr::left_join(y = CellChatDB$geneInfo, by = join_by(Symbol == Symbol)) |>
+                        dplyr::select(Symbol) |> 
+                        dplyr::filter(Symbol != "") |>
+                        distinct() |> 
+                        unlist()) |>
+  unique() 
+
+# Same for receptors
+cellchat_receptors <- CellChatDB$interaction |> 
+  dplyr::filter(annotation == "Secreted Signaling") |> 
+  dplyr::left_join(y = CellChatDB$geneInfo, by = join_by(receptor == Symbol)) |>
+  dplyr::select(receptor) |> 
+  distinct() |> 
+  dplyr::filter(receptor != "") |>
+  unlist()
+## Add complexes
+cellchat_receptors <- c(cellchat_receptors,
+                        CellChatDB$interaction |> 
+                          dplyr::filter(annotation == "Secreted Signaling") |> 
+                          dplyr::left_join(y = CellChatDB.complex, 
+                                    by = join_by(receptor == Complex), 
+                                    relationship = "many-to-many") |> 
+                          dplyr::filter(!is.na(Symbol)) |> 
+                          dplyr::left_join(y = CellChatDB$geneInfo, by = join_by(Symbol == Symbol)) |>
+                          dplyr::select(Symbol) |> 
+                          dplyr::filter(Symbol != "") |>
+                          distinct() |> 
+                          unlist()) |>
+  unique() 
+
+
+## CellTalkDB ##################################################################
+CellTalkDB <- readRDS(url("https://github.com/ZJUFanLab/CellTalkDB/raw/f33e0e6dd3c143193d593b5dad8c613280b94699/database/human_lr_pair.rds"))
+
+## Let's convert protein IDs to gene IDs using EnsemblDB
+celltalk_ligands <- mapIds(edb, key=unique(CellTalkDB$ligand_ensembl_protein_id), keytype="PROTEINID", column="GENEID") 
+celltalk_ligands <- celltalk_ligands[!is.na(celltalk_ligands)]
+
+## Same for receptors
+celltalk_receptors <- mapIds(edb, key=unique(CellTalkDB$receptor_ensembl_protein_id), keytype="PROTEINID", column="GENEID") 
+celltalk_receptors <- celltalk_receptors[!is.na(celltalk_receptors)]
+
+
+## CellPhoneDB #################################################################
+CellPhoneDB <- read.csv(file = 'https://raw.githubusercontent.com/ventolab/cellphonedb-data/753d63da75dc11730edc0c4b01fbc9100584f77d/data/interaction_input.csv')
+complex_input <- read.csv(file = 'https://raw.githubusercontent.com/ventolab/cellphonedb-data/753d63da75dc11730edc0c4b01fbc9100584f77d/data/complex_input.csv', row.names = 1)
+geneInfo <- read.csv(file = 'https://raw.githubusercontent.com/ventolab/cellphonedb-data/753d63da75dc11730edc0c4b01fbc9100584f77d/data/gene_input.csv')
+
+## process similar to CellChatDB
+cellphone_ligands <- CellPhoneDB |> 
+  dplyr::filter(directionality == "Ligand-Receptor") |> 
+  dplyr::left_join(y = geneInfo, 
+            by = join_by(partner_a == uniprot), 
+            relationship = "many-to-many") |>
+  dplyr::select(ensembl) |> 
+  distinct() |> 
+  dplyr::filter(ensembl != "") |>
+  unlist() 
+## Add complexes
+cellphoneDB.complex <- complex_input |> 
+  as_tibble(rownames = "Complex") |> 
+  pivot_longer(cols = starts_with("uniprot_"), names_to = "Subunit", values_to = "uniprot") |> 
+  dplyr::filter(uniprot != "") |> 
+  distinct() |> 
+  dplyr::select(Complex, uniprot)
+cellphone_ligands <- c(cellphone_ligands,
+                      CellPhoneDB |> 
+                        dplyr::filter(directionality == "Ligand-Receptor") |> 
+                        dplyr::left_join(y = cellphoneDB.complex, 
+                                  by = join_by(partner_a == Complex),
+                                  relationship = "many-to-many") |> 
+                        dplyr::filter(!is.na(uniprot)) |> 
+                        dplyr::left_join(y = geneInfo, 
+                                  by = join_by(uniprot == uniprot), 
+                                  relationship = "many-to-many") |>
+                        dplyr::select(ensembl) |> 
+                        dplyr::filter(ensembl != "") |>
+                        distinct() |> 
+                        unlist()) |>
+  unique() 
+
+## receptors
+cellphone_receptors <- CellPhoneDB |> 
+  dplyr::filter(directionality == "Ligand-Receptor") |> 
+  dplyr::left_join(y = geneInfo, 
+            by = join_by(partner_b == uniprot),
+            relationship = "many-to-many") |>
+  dplyr::select(ensembl) |> 
+  distinct() |> 
+  dplyr::filter(ensembl != "") |>
+  unlist() 
+## Add complexes
+cellphone_receptors <- c(cellphone_receptors,
+                      CellPhoneDB |> 
+                        dplyr::filter(directionality == "Ligand-Receptor") |> 
+                        dplyr::left_join(y = cellphoneDB.complex, 
+                                  by = join_by(partner_b == Complex),
+                                  relationship = "many-to-many") |> 
+                        dplyr::filter(!is.na(uniprot)) |> 
+                        dplyr::left_join(y = geneInfo, 
+                                  by = join_by(uniprot == uniprot),
+                                  relationship = "many-to-many") |>
+                        dplyr::select(ensembl) |> 
+                        dplyr::filter(ensembl != "") |>
+                        distinct() |> 
+                        unlist()) |>
+  unique() 
+
+
+## Merge 3 databases together, keeping only genes in dge.subset ################
+all_ligands <- unique(c(dge.subset$genes$GENEID[dge.subset$genes$SYMBOL %in% cellchat_ligands], 
+                        dge.subset$genes$GENEID[dge.subset$genes$GENEID %in% celltalk_ligands], 
+                        dge.subset$genes$GENEID[dge.subset$genes$GENEID %in% cellphone_ligands]))
+all_receptors <- unique(c(dge.subset$genes$GENEID[dge.subset$genes$SYMBOL %in% cellchat_receptors], 
+                          dge.subset$genes$GENEID[dge.subset$genes$GENEID %in% celltalk_receptors], 
+                          dge.subset$genes$GENEID[dge.subset$genes$GENEID %in% cellphone_receptors]))
+## When overlap between ligand and receptor list, keep genes only as ligand
+all_receptors <- all_receptors[!all_receptors %in% all_ligands]
+
+## Save in case some resources become unavailable
+# saveRDS(all_ligands, "data/ligands_combined.rds")
+# saveRDS(all_receptors, "data/receptors_combined.rds")
+```
+
+## Figures 3A and S2A
+MA plots
+
+```{r MAplot, fig.width=8, fig.height=8}
+# all_ligands <- readRDS("data/ligands_combined.rds")
+# all_receptors <- readRDS("data/receptors_combined.rds")
+myDf <- top
+myDf$Significant <- FALSE
+myDf$Significant[myDf$adj.P.Val <= 0.05 & myDf$logFC > 0] <- "Up"
+myDf$Significant[myDf$adj.P.Val <= 0.05 & myDf$logFC < 0] <- "Down"
+myDf$Significant <- factor(myDf$Significant, levels=c("Up", "Down", FALSE))
+## Sort points so that significant points are plotted last
+myDf <- myDf[order(myDf$Significant, decreasing = T), ]
+
+f <- ggplot(myDf, aes(x=AveExpr, y=logFC)) + 
+  ylab(bquote('log'[2]~'Fold-Change')) +
+  xlab("Average expression") +
+  geom_point(aes(color=Significant, alpha=Significant), shape=16) +
+  scale_color_manual(name="Significant",  
+                     limits=c("Up", "Down"), 
+                     values=unname(c(myPalette[1], myPalette[2])),
+                     na.value = "grey80") +
+  scale_alpha_manual(values=c(1,1,0.6), guide="none") +
+  myTheme + 
+  theme(legend.position="bottom")
+
+## Label ligands
+myDf$ligand <- myDf$SYMBOL
+myDf$ligand[myDf$adj.P.Val > 0.05 | !myDf$GENEID %in% all_ligands] <- ""
+f3p1 <- f + geom_label_repel(data = myDf[myDf$ligand != "", ],
+                   aes(x=AveExpr, y=logFC),
+                   label=myDf[myDf$ligand != "", ]$ligand,
+                   min.segment.length = unit(0, 'lines'), # always draw segment pointing to the gene
+                   size=3,
+                   color="black",
+                   direction = "both",
+                   point.padding = 0.1,
+                   box.padding = 0.3,
+                   max.overlaps = 30, 
+                   seed=1234) 
+f3p1
+
+## Label receptors
+myDf$receptor <- myDf$SYMBOL
+myDf$receptor[myDf$adj.P.Val > 0.05 | !myDf$GENEID %in% all_receptors] <- ""
+fs2p1 <- f + geom_label_repel(data = myDf[myDf$receptor != "", ],
+                   aes(x=AveExpr, y=logFC),
+                   label=myDf[myDf$receptor != "", ]$receptor,
+                   min.segment.length = unit(0, 'lines'), 
+                   size=3,
+                   color="black",
+                   direction = "both",
+                   point.padding = 0.1,
+                   box.padding = 0.3,
+                   max.overlaps = 25, 
+                   seed=1234) 
+fs2p1
+```
+
+## Figure S2B
+Boxplots showing normalized expression of top DE genes
+
+```{r figs2b, fig.width=10, fig.height=12}
+top <- topTable(fit2, coef=1, p.value=0.01, n=Inf, sort.by = "P")
+# Remove 2 genes because they have identical sequences (same reads are counted)
+top <- top[!top$SYMBOL %in% c("BLOC1S5-TXNDC5", # same sequence as TXNDC5
+                              "IGKV2-30"), ]    # same sequence as IGKV2D-30
+
+myDf <- log2cpm.loess[top$GENEID,] |>
+  as_tibble(rownames = NA) |> 
+  rownames_to_column() |>
+  dplyr::rename(Gene = rowname) |>
+  pivot_longer(cols= colnames(log2cpm.loess), 
+               names_to = "Sample",
+               values_to = "log2CPM") |> 
+  dplyr::left_join(y=rownames_to_column(as_tibble(dge.subset$samples)), by = join_by("Sample")) |>
+  dplyr::left_join(y=as_tibble(dge.subset$genes), by=join_by("Gene" == "GENEID"))
+## Reorder subgroups
+myDf$Patient.subgroup <- factor(myDf$Patient.subgroup, levels = c("No diabetes", "Insulin dependent T2D / No remission", "T2D / No remission", "T2D / Remission", "Unknown"))
+
+## Order of genes: significance + separate up (first) and down-regulated genes (then)
+myDf$SYMBOL <- factor(myDf$SYMBOL, levels=c(top[top$logFC > 0, ]$SYMBOL, top[top$logFC < 0, ]$SYMBOL))
+
+## Same plot colored by subgroup (see CCR9 with higher expression in no_diabetes)
+fs2p2 <- ggplot(myDf, aes(x=Visit, y=log2CPM, group=Patient, col=Patient.subgroup)) +
+  facet_wrap( ~ SYMBOL, scales = "free_y", ncol = 5) +
+  geom_line(position = position_dodge(0.2), alpha = .5) +
+  geom_point(position = position_dodge(0.2), alpha = .8, size=2) +
+  scale_colour_manual(name="Patient subgroup", values=setNames(myPalette[c(9,5,6,7,8)], c("No diabetes", "Insulin dependent T2D / No remission", "T2D / No remission", "T2D / Remission", "unknown"))) +
+  ylab(bquote('log'[2]~'CPM')) +
+  xlab("") +
+  myTheme + 
+  theme(strip.background = element_blank(), 
+        strip.text.x = element_text(size = 14, vjust = 0, face = "bold"),
+        strip.clip = "off",
+        panel.spacing.x = unit(3, "points"), 
+        panel.spacing.y = unit(0, "points"), 
+        axis.text.y = element_text(size = 8), 
+        legend.position="bottom")
+fs2p2
+```
+
+## Figure 3B
+Transcription factor activity inference
+
+We obtained the TF to target map from the `CollecTRI` collection. We used the `decoupleR` package version 2.9.7 (Bioconductor 3.18), the mapping with more recent versions might differ, so below we read directly from a saved object.
+
+```{r TFs, fig.width=9}
+# net <- get_collectri(organism='human', split_complexes=FALSE)
+# saveRDS(net, file="data/CollecTRI.rds") 
+net <- readRDS(file="data/CollecTRI.rds") 
+
+# We infer TF activities from the t-values of the DEGs between v4 and v1
+top <- topTable(fit2, n=Inf, p=1, sort.by = "none")[!duplicated(dge.subset$genes$SYMBOL), ]
+row.names(top) <- top$SYMBOL
+contrast_acts <- run_ulm(mat=top[, 't', drop=FALSE], net=net, minsize = 10)
+
+## Perform FDR correction and keep significant TFs
+f_contrast_acts <- contrast_acts |> 
+  mutate(FDR = p.adjust(contrast_acts$p_value, method="BH")) |> 
+  dplyr::filter(FDR < 0.1) |> 
+  arrange(score) 
+f_contrast_acts
+
+## Plot for paper
+f3p2 <- ggplot(f_contrast_acts, aes(x = reorder(source, score), y = score)) + 
+  geom_bar(aes(fill = score), stat = "identity") +
+  xlab("") + 
+  scale_fill_gradient2(low = myPalette[2], high = myPalette[1], mid = "white", midpoint = 0) + 
+  myTheme + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid.major.x = element_blank(), 
+        panel.grid.minor.x = element_blank()) 
+f3p2
+```
+
+# GSEA
+## Obtain Reactom and Wikipathways pathways
+We download the pathways from the MSigDB version `2023.2.Hs` database, available on the release archive
+
+```{r MSigDB}
+if(!file.exists("data/msigdb_v2023.2.Hs.db")){
+  download.file("https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2023.2.Hs/msigdb_v2023.2.Hs.db.zip", destfile = "data/msigdb_v2023.2.Hs.db.zip")
+  unzip("data/msigdb_v2023.2.Hs.db.zip", exdir = "data/")
+}
+
+## connect to db
+con <- dbConnect(drv=SQLite(), dbname="data/msigdb_v2023.2.Hs.db")
+temp <- dbGetQuery(conn=con, statement="SELECT gene_set.standard_name, gene_set.collection_name, gene_symbol.symbol
+                                        FROM gene_set
+                                        LEFT JOIN gene_set_gene_symbol
+                                           ON gene_set.id = gene_set_gene_symbol.gene_set_id
+                                        LEFT JOIN gene_symbol
+                                           ON gene_symbol.id = gene_set_gene_symbol.gene_symbol_id
+                                        WHERE gene_set.collection_name='C2:CP:REACTOME' OR gene_set.collection_name='C2:CP:WIKIPATHWAYS'")
+table(temp$collection_name)
+## Let's turn this into structured lists, one per collection
+collections <- sort(unique(temp$collection_name))
+for (f in collections) {
+  cat(f, "\n")
+  myList <- tapply(temp[temp$collection_name %in% f, ], 
+         factor(temp$standard_name[temp$collection_name %in% f]),
+         function(x){
+           return(dge.subset$genes$GENEID[dge.subset$genes$SYMBOL %in% unique(x$symbol)]) 
+         })   
+  myCollection <- paste0(make.names(f), ".CATEGORY.v2023.2.Hs.ensembl.hsa")
+  assign(myCollection, myList)
+}
+rm(temp)
+dbDisconnect(con)
+```
+
+## Obtain Gene Ontology gene sets
+
+For the paper we obtained the GO mapping from the `org.Hs.eg.db` annotation package version 3.18. The mapping with other Bioconductor versions might differ, so below we read directly from a saved object in an `.rds` file. 
+
+```{r GO}
+## Perform the query
+# updatedGO <- AnnotationDbi::select(org.Hs.eg.db, keys=dge.subset$genes$GENEID, keytype = "ENSEMBL", columns=c("GOALL", "EVIDENCEALL", "ONTOLOGYALL")) 
+# updatedGO <- tapply(updatedGO$ENSEMBL, list(updatedGO$GOALL), unique)
+# saveRDS(updatedGO, file="data/GO_mapping.rds") 
+
+updatedGO <- readRDS(file="data/GO_mapping.rds") 
+```
+
+## Testing with Roast
+This performs a self-contained enrichment test. All results are stored into a list `resRoast`
+
+```{r roast}
+# Used below for calculation of average logFC
+top <- topTable(fit2, p.value = 1, n=Inf, sort="none")
+geneList <- setNames(top$logFC, top$GENEID)
+
+resRoast <- list()
+for (f in c(paste0(make.names(collections), ".CATEGORY.v2023.2.Hs.ensembl.hsa"), "updatedGO")) {
+  resRoast[[f]] <- list()
+
+  ## process and filter gene sets
+  indx <- ids2indices(gene.sets=get(f), identifiers=rownames(fit2$genes))
+  indx <- indx[sapply(indx, length) >= 10]
+  
+  ## enrichment test
+  resRoast[[f]] <- fry(log2cpm.loess, indx, moma, contrast = contrasts.matrix, sort = "directional")
+  
+  ## Add average logFC for every gene set
+  resRoast[[f]]$aveLog2FC <- sapply(indx, function(x) mean(geneList[x], na.rm=T))[rownames(resRoast[[f]])]
+}
+# Add useful info for GO terms
+resRoast$updatedGO <- cbind(resRoast$updatedGO, AnnotationDbi::select(GO.db, keys=row.names(resRoast$updatedGO), keytype = "GOID", columns=c("ONTOLOGY", "TERM", "DEFINITION")))
+
+# Results used in the paper:
+resRoast$updatedGO |> dplyr::select(ONTOLOGY, TERM, DEFINITION, NGenes, Direction, aveLog2FC, FDR) |> head()
+resRoast$C2.CP.REACTOME.CATEGORY.v2023.2.Hs.ensembl.hsa |> dplyr::select(NGenes, Direction, aveLog2FC, FDR) |> head()
+resRoast$C2.CP.WIKIPATHWAYS.CATEGORY.v2023.2.Hs.ensembl.hsa |> dplyr::select(NGenes, Direction, aveLog2FC, FDR) |> head()
+```
+
+## Figures 4 and S4
+Display the gene overlap between significant gene sets
+
+```{r network, fig.width=16, fig.height=14, warning=FALSE}
+## Function inspired from enrichplot:::emapplot.enrichResult
+prepare_graph <- function(x, ## a roast/camera output: subset to the categories to plot
+                          min_edge = 0.1, ## min fraction of overlap
+                          pair_sim = NULL, # x@termsim from pairwise_termsim(), or a similarity matrix. row and columns should match row.names of x
+                          NGenes = "NGenes", # column with set size info
+                          colVar = "aveLog2FC", # column used for coloring
+                          ...){
+  if (!is.numeric(min_edge) | min_edge < 0 | min_edge > 1) {
+    stop('"min_edge" should be a number between 0 and 1.')
+  }
+  y <- as.data.frame(x)
+  y$ID <- row.names(y)
+  
+  ## Similarity matrix
+  w <- as.matrix(pair_sim[row.names(y), row.names(y)])
+  ## Pivot
+  wd <- w |>
+    as_tibble(rownames = "category1") |>
+    pivot_longer(cols= colnames(w), 
+                 names_to = "category2",
+                 values_to = "similarity") |> 
+    distinct() |>
+    dplyr::filter(category1 != category2) |> 
+    dplyr::filter(!is.na(similarity)) |>
+    as.data.frame()
+  
+  ## Make graph
+  g <- graph.data.frame(wd[, c("category1", "category2")], directed=FALSE)
+  E(g)$width <- wd[, "similarity"] 
+  ## Use similarity as the weight(length) of an edge
+  E(g)$weight <- wd[, "similarity"]
+  ## Delete when overlap is low
+  g <- delete.edges(g, E(g)[wd[, "similarity"] < min_edge])
+  
+  ## Size of vertices
+  V(g)$size <- y[V(g)$name, NGenes] 
+  ## Value used for coloring of the vertices
+  V(g)$color <- y[V(g)$name, colVar]
+  
+  return(g)
+}
+
+## Reactome results ############################################################
+myResults <- resRoast$C2.CP.REACTOME.CATEGORY.v2023.2.Hs.ensembl.hsa
+## Filter out gene sets that are very large, and keep the significant ones with largest effect size
+myResults <- myResults[myResults$FDR < 0.05 & 
+                         myResults$NGenes < 100 & 
+                         abs(myResults$aveLog2FC) > 0.1, ] 
+dim(myResults)
+
+## Build similarity matrix (Jaccard coefficient)
+geneSets <- C2.CP.REACTOME.CATEGORY.v2023.2.Hs.ensembl.hsa[row.names(myResults)]
+n <- length(geneSets)
+w <- matrix(NA, nrow = n, ncol = n)
+colnames(w) <- rownames(w) <- names(geneSets)
+for (i in seq_len(n - 1)) {
+  for (j in (i + 1):n) {
+    w[i, j] <-  length(intersect(geneSets[[i]], geneSets[[j]]))/length(unique(c(geneSets[[i]], geneSets[[j]])))
+  }
+}
+## process and simplify names
+pair_sim <- w[row.names(myResults), row.names(myResults)]
+row.names(myResults) <- gsub("^REACTOME_", "", row.names(myResults))
+colnames(pair_sim) <- rownames(pair_sim) <- row.names(myResults)
+
+g <- prepare_graph(myResults,
+                   min_edge = 0.1, 
+                   pair_sim = pair_sim,
+                   NGenes = "NGenes", 
+                   colVar = "aveLog2FC", 
+                   layout = "nicely")
+## Cut gene sets names that are too long
+V(g)$name[nchar(V(g)$name) > 50] <- paste0(substr(V(g)$name[nchar(V(g)$name) > 50], 1, 47), "...")
+
+set.seed(1234) ## because graph plotting function is not deterministic
+f4 <- ggraph(g, layout="nicely") +
+  geom_edge_link(aes(edge_width = width), 
+                 alpha=1, colour = "darkgrey") + 
+  geom_node_point(aes(size = size,
+                      fill = color),
+                  shape = 21, color="grey10") + 
+  geom_node_text(aes(label=name),
+                 size = 3, bg.color = "white", repel=TRUE) + 
+  scale_size_continuous(name = "Number of genes", limits = c(10,100), range=c(1,10)) + 
+  scale_edge_width_continuous(name = "Jaccard overlap", limits = c(0.1,1), range = c(0.1, 2)) +
+  scale_fill_gradient2(name = "aveLog2FC", low = myPalette[2], high = myPalette[1]) + 
+  coord_equal() + 
+  theme_void() 
+f4
+
+## Wikipathways results ########################################################
+myResults <- resRoast$C2.CP.WIKIPATHWAYS.CATEGORY.v2023.2.Hs.ensembl.hsa
+myResults <- myResults[myResults$FDR < 0.05 & 
+                         myResults$NGenes < 100 &
+                         abs(myResults$aveLog2FC) > 0.1, ] 
+dim(myResults)
+
+geneSets <- C2.CP.WIKIPATHWAYS.CATEGORY.v2023.2.Hs.ensembl.hsa[row.names(myResults)]
+n <- length(geneSets)
+w <- matrix(NA, nrow = n, ncol = n)
+colnames(w) <- rownames(w) <- names(geneSets)
+for (i in seq_len(n - 1)) {
+  for (j in (i + 1):n) {
+    w[i, j] <-  length(intersect(geneSets[[i]], geneSets[[j]]))/length(unique(c(geneSets[[i]], geneSets[[j]])))
+  }
+}
+pair_sim <- w[row.names(myResults), row.names(myResults)]
+row.names(myResults) <- gsub("^WP_", "", row.names(myResults))
+colnames(pair_sim) <- rownames(pair_sim) <- row.names(myResults)
+
+g <- prepare_graph(myResults,
+                   min_edge = 0.1, 
+                   pair_sim = pair_sim,
+                   NGenes = "NGenes", 
+                   colVar = "aveLog2FC", 
+                   layout = "nicely")
+V(g)$name[nchar(V(g)$name) > 50] <- paste0(substr(V(g)$name[nchar(V(g)$name) > 50], 1, 47), "...")
+
+set.seed(1234) ## because graph plotting function is not deterministic
+fs4p1 <- ggraph(g, layout="nicely") +
+  geom_edge_link(aes(edge_width = width), 
+                 alpha=1, colour = "darkgrey") + 
+  geom_node_point(aes(size = size,
+                      fill = color),
+                  shape = 21, color="grey10") + 
+  geom_node_text(aes(label=name),
+                 size = 3, bg.color = "white", repel=TRUE) + 
+  scale_size_continuous(name = "Number of genes", limits = c(10,100), range=c(1,10)) + 
+  scale_edge_width_continuous(name = "Jaccard overlap", limits = c(0.1,1), range = c(0.1, 2)) +
+  scale_fill_gradient2(name = "aveLog2FC", low = myPalette[2], high = myPalette[1]) + 
+  coord_equal() + 
+  theme_void() 
+fs4p1
+
+## Gene Ontology results #######################################################
+myResults <- resRoast$updatedGO
+myResults <- myResults[myResults$FDR < 0.05 & 
+                         myResults$NGenes < 100 & 
+                         abs(myResults$aveLog2FC) > 0.1, ] 
+dim(myResults)
+
+geneSets <- updatedGO[row.names(myResults)]
+n <- length(geneSets)
+w <- matrix(NA, nrow = n, ncol = n)
+colnames(w) <- rownames(w) <- names(geneSets)
+for (i in seq_len(n - 1)) {
+  for (j in (i + 1):n) {
+    w[i, j] <-  length(intersect(geneSets[[i]], geneSets[[j]]))/length(unique(c(geneSets[[i]], geneSets[[j]])))
+  }
+}
+pair_sim <- w[row.names(myResults), row.names(myResults)]
+row.names(myResults) <- str_to_title(myResults$TERM)
+colnames(pair_sim) <- rownames(pair_sim) <- row.names(myResults)
+
+g <- prepare_graph(myResults,
+                   min_edge = 0.1, 
+                   pair_sim = pair_sim,
+                   NGenes = "NGenes", 
+                   colVar = "aveLog2FC", 
+                   layout = "nicely")
+V(g)$name[nchar(V(g)$name) > 50] <- paste0(substr(V(g)$name[nchar(V(g)$name) > 50], 1, 47), "...")
+
+set.seed(1234) ## because graph plotting function is not deterministic
+fs4p2 <- ggraph(g, layout="nicely") +
+  geom_edge_link(aes(edge_width = width), 
+                 alpha=1, colour = "darkgrey") + 
+  geom_node_point(aes(size = size,
+                      fill = color),
+                  shape = 21, color="grey10") + 
+  geom_node_text(aes(label=name),
+                 size = 3, bg.color = "white", repel=TRUE) + 
+  scale_size_continuous(name = "Number of genes", limits = c(10,100), range=c(1,10)) + 
+  scale_edge_width_continuous(name = "Jaccard overlap", limits = c(0.1,1), range = c(0.1, 2)) +
+  scale_fill_gradient2(name = "aveLog2FC", low = myPalette[2], high = myPalette[1]) + 
+  coord_equal() + 
+  theme_void() 
+fs4p2
+```
+
+# Figure 5
+Inference of cell type abundances with `xCell`, available here: https://github.com/dviraran/xCell
+
+```{r DA, warning=FALSE, message=FALSE, results='hide'}
+# Normalizing to gene length is required. We use the total length of genomic regions used for counting by FeatureCounts to calculate RPKMs
+exprMatrix <- log2cpm.loess - log2( dge.subset$genes$LENGTH / 1000 )
+row.names(exprMatrix) <- dge.subset$genes$SYMBOL
+## Remove duplicated symbols
+exprMatrix <- exprMatrix[ !duplicated(row.names(exprMatrix)), ]
+
+## Filtering of cell types: 
+# - we do not run on cell types which are not expected in blood 
+# - we excluded as a 2nd step the cell types which gave enrichment scores ~ 0 in almost all samples (Tgd cells, CD4+ naive T-cells and NK cells)        
+set.seed(1234) 
+xCellresults <- xCellAnalysis(exprMatrix, cell.types.use = c("B-cells", "naive B-cells",  "Memory B-cells", 
+                                                             "Class-switched memory B-cells","Plasma cells", 
+                                                             "CD4+ T-cells", "CD4+ memory T-cells", "CD4+ Tcm", "CD4+ Tem", 
+                                                             "CD8+ T-cells", "CD8+ naive T-cells", "CD8+ Tcm", "CD8+ Tem",
+                                                             "Th2 cells", "Th1 cells", "Tregs", 
+                                                             "NKT", 
+                                                             "Monocytes", "Macrophages", "Macrophages M1", "Macrophages M2", 
+                                                             "DC", "aDC", "cDC", "iDC", "pDC", 
+                                                             "Neutrophils", 
+                                                             "Erythrocytes", "Platelets", "Megakaryocytes", 
+                                                             "Basophils", "Eosinophils", "Mast cells"))
+
+## Significance testing with limma
+all(colnames(dge.subset) == colnames(xCellresults))
+fit.ct <- lmFit(xCellresults, moma) 
+fit2.ct <- contrasts.fit(fit.ct, contrasts.matrix)
+fit2.ct <- eBayes(fit2.ct, trend=TRUE, robust=TRUE)
+## Only 3 cell types significant at FDR=5%. Use a more lenient FDR cutoff of 20%
+table(de <- decideTests(fit2.ct, p.value = 0.2))
+top <- topTable(fit2.ct, coef=1, p.value=0.2, n=10, sort.by = "P")
+```
+
+```{r DA2, fig.width=8, fig.height=8}
+top
+
+## Plot the significant cell types 
+myDf <- xCellresults[row.names(xCellresults) %in% row.names(top), ] |>
+  as_tibble(rownames = NA) |> 
+  rownames_to_column() |>
+  dplyr::rename("Cell Type" = rowname) |>
+  pivot_longer(cols= colnames(xCellresults), 
+               names_to = "Sample",
+               values_to = "Score") |> 
+  dplyr::left_join(y=as_tibble(dge.subset$samples), by = join_by("Sample")) 
+## Reorder levels
+myDf$Patient.subgroup <- factor(myDf$Patient.subgroup, levels = c("No diabetes", "Insulin dependent T2D / No remission", "T2D / No remission", "T2D / Remission", "Unknown"))
+## Reorder of cell types according to direction and significance
+myDf$`Cell Type` <- factor(myDf$`Cell Type`, levels=c(row.names(top)[top$logFC > 0], row.names(top)[top$logFC < 0]))
+
+f5 <- ggplot(myDf, aes(x=Visit, y=Score, group=Patient, col=Patient.subgroup)) +
+  facet_wrap( ~ `Cell Type`, scales = "free_y", ncol = 5) +
+  geom_line(position = position_dodge(0.2), alpha = .5) +
+  geom_point(position = position_dodge(0.2), alpha = .8, size=2) +
+  scale_colour_manual(name="Patient subgroup", values=setNames(myPalette[c(9,5,6,7,8)], c("No diabetes", "Insulin dependent T2D / No remission", "T2D / No remission", "T2D / Remission", "unknown"))) +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, .05))) +
+  ylab(bquote('Enrichment score')) +
+  xlab("") +
+  myTheme + 
+  theme(strip.background = element_blank(), 
+        strip.text.x = element_text(size = 14, vjust = 0, face = "bold"),
+        strip.clip = "off",
+        panel.spacing.x = unit(3, "points"), 
+        panel.spacing.y = unit(0, "points"), 
+        axis.text.y = element_text(size = 8), 
+        legend.position="bottom")
+f5
+```
+
+# Figure 6
+
+## Homuth et al.
+https://bmcmedgenomics.biomedcentral.com/articles/10.1186/s12920-015-0141-x
+
+```{r homuth, fig.width=8, fig.height=7, warning=FALSE} 
+## Download Additional file 2 from paper
+if(!file.exists("data/Homuth.xlsx")){
+  download.file("https://static-content.springer.com/esm/art%3A10.1186%2Fs12920-015-0141-x/MediaObjects/12920_2015_141_MOESM2_ESM.xlsx", destfile = "data/Homuth.xlsx")
+}
+## Supplementary Table 34:	Results of sensitivity analyses in KORA F4 "BASIC MODEL: Adjustment for age, sex, technical covariates, and blood cell counts"
+tab <- readxl::read_excel("data/Homuth.xlsx", sheet = 36, skip = 1)
+## Refresh illumina array annotation
+tab$GENEID <- AnnotationDbi::mapIds(illuminaHumanv3.db, keys = tab$`...2`, keytype = "PROBEID", column = "ENSEMBL", multiVals = "first")
+## Average effect size of probes matching to same Ensembl gene
+tab <- tab[!is.na(tab$GENEID), ]
+tab <- avereps(tab$`Effect...8`, tab$GENEID)
+colnames(tab)[1] <- "effect_size"
+
+## Load our data
+top.x <- topTable(fit2, coef="Post_vs_pre", sort.by = "none", n=Inf)
+## Merge
+myDf <- merge(top.x, tab, by.x="GENEID", by.y=0) 
+
+## Total least squares regression 
+v <- prcomp(myDf[, c("logFC", "effect_size")])
+slp <- v$rotation[2,1] / v$rotation[1,1]
+int <- v$center[2] - slp*v$center[1]
+
+## Labeling specific categories of genes: we use the clusters of proteins (encoded by significantly down-regulated genes) from the STRINGdb analysis (Figure S3)
+stringClusters <- read.table("data/string_MCL_clusters.tsv", h=T, sep="\t", quote="", comment.char = "")
+myDf$highlight <- NA
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 4]] <- "NFKB" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 7]] <- "Neutrophils" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 8]] <- "Erythrocytes" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 12]] <- "Hemoglobin"
+## We add all other hemoglobin subunits
+myDf$highlight[grep("^hemoglobin subunit", myDf$DESCRIPTION)] <- "Hemoglobin" 
+myDf$highlight[grep("^MT-", myDf$SYMBOL)] <- "Mitochondrial" 
+table(myDf$highlight)
+myDf$highlight <- factor(myDf$highlight, levels = c("Neutrophils", "NFKB", "Erythrocytes", "Hemoglobin", "Mitochondrial"))
+myDf <- myDf[order(myDf$highlight), ]
+myDf <- rbind(myDf[is.na(myDf$highlight), ], 
+              myDf[!is.na(myDf$highlight), ])
+
+## Define colors to be used
+myColorNeutro  <- myPalette[3]
+myColorMito    <- myPalette[4]
+myColorHemo    <- myPalette[5]
+myColorErythro <- myPalette[6]
+myColorNfkb    <- myPalette[7]
+
+f6p1 <- ggplot(myDf, aes(x=logFC, y=effect_size)) + 
+  ylab(bquote('Effect size')) +
+  xlab(bquote('log'[2]~'Fold-Change')) +
+  geom_point(aes(color=highlight, alpha=highlight, size=highlight), shape=16) +
+  geom_density_2d(col="grey30") +
+  
+  ## Correlation coefficient
+  stat_cor(label.x = 2.12, label.y = 0.077, aes(label = after_stat(r.label)), size=7, hjust=1) + 
+  ## Regression line slope and intercept 
+  geom_abline(slope=slp, intercept=int, linewidth = 1, color="grey30") +
+
+  ## Fix limits 
+  xlim(c(-2.12, 2.12)) +
+  ylim(c(-0.077, 0.077)) +
+  scale_color_manual(name="",
+    limits=sort(unique(myDf$highlight)),
+    values=unname(c(myColorNeutro, myColorNfkb, myColorErythro, myColorHemo, myColorMito)),
+    na.value = "grey80") +
+  scale_size_manual(values=c(2,2,2,2,2), guide="none", na.value = 1) +
+  scale_alpha_manual(values=c(1,1,1,1,1), guide="none", na.value = 0.5) +
+  annotate(geom = "text", x=-2.12, y=0, label="Effect of BMI (Homuth et al.)", angle = 90, size=5, fontface = 'italic') +
+  annotate(geom = "text", x=0, y=-0.077, label="V4 vs. V1 (this study)", size=5, fontface = 'italic') +
+  myTheme
+f6p1
+```
+
+## Kalafati et al.
+https://genesandnutrition.biomedcentral.com/articles/10.1186/s12263-021-00702-7
+
+```{r kalafati, fig.width=8, fig.height=7} 
+## Load DE analysis file obtained from the authors upon request
+tab <- read.table("data/Kalafati.txt", sep="\t", h=T, row.names = 1)
+
+## Load our data
+top.x <- topTable(fit2, coef="Post_vs_pre", sort.by = "none", n=Inf)
+## Merge
+myDf <- merge(top.x, tab, by.x="GENEID", by.y=0) 
+
+## One lncRNA behaves like an outlier, with log2FC of 18.4, let's filter it out
+myDf <- myDf[myDf$GENEID != "ENSG00000250302", ]
+
+## Total least squares regression 
+v <- prcomp(myDf[, c("logFC", "log2FoldChange")])
+slp <- v$rotation[2,1] / v$rotation[1,1]
+int <- v$center[2] - slp*v$center[1]
+
+## Labeling specific categories of genes
+myDf$highlight <- NA
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 4]] <- "NFKB" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 7]] <- "Neutrophils" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 8]] <- "Erythrocytes" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 12]] <- "Hemoglobin"
+## We add all other hemoglobin subunits
+myDf$highlight[grep("^hemoglobin subunit", myDf$DESCRIPTION)] <- "Hemoglobin" 
+myDf$highlight[grep("^MT-", myDf$SYMBOL)] <- "Mitochondrial" 
+table(myDf$highlight)
+myDf$highlight <- factor(myDf$highlight, levels = c("Neutrophils", "NFKB", "Erythrocytes", "Hemoglobin", "Mitochondrial"))
+myDf <- myDf[order(myDf$highlight), ]
+myDf <- rbind(myDf[is.na(myDf$highlight), ], 
+              myDf[!is.na(myDf$highlight), ])
+
+f6p2 <- ggplot(myDf, aes(x=logFC, y=log2FoldChange)) + 
+  ylab(bquote('log'[2]~'Fold-Change')) +
+  xlab(bquote('log'[2]~'Fold-Change')) +
+  geom_point(aes(color=highlight, alpha=highlight, size=highlight), shape=16) +
+  geom_density_2d(col="grey30") +
+  
+  ## Correlation coefficient
+  stat_cor(label.x = 2.12, label.y = 3, aes(label = after_stat(r.label)), size=7, hjust=1) + 
+  ## Regression line slope and intercept 
+  geom_abline(slope=slp, intercept=int, linewidth = 1, color="grey30") +
+
+  ## Fix limits 
+  xlim(c(-2.12, 2.12)) +
+  ylim(c(-3, 3)) +
+  scale_color_manual(name="",
+    limits=sort(unique(myDf$highlight)),
+    values=unname(c(myColorNeutro, myColorNfkb, myColorErythro, myColorHemo, myColorMito)),
+    na.value = "grey80") +
+  scale_size_manual(values=c(2,2,2,2,2), guide="none", na.value = 1) +
+  scale_alpha_manual(values=c(1,1,1,1,1), guide="none", na.value = 0.5) +
+  annotate(geom = "text", x=-2.12, y=0, label="Insulin-resistant vs. sensitive (Kalafati et al.)", angle = 90, size=5, fontface = 'italic') +
+  annotate(geom = "text", x=0, y=-3, label="V4 vs. V1 (this study)", size=5, fontface = 'italic') +
+  myTheme 
+f6p2
+```
+
+## Wesolowska-Andersen et al.
+https://www.sciencedirect.com/science/article/pii/S2666379121003499
+
+```{r wesolowska, fig.width=8, fig.height=7} 
+## Download Table S5F from paper
+if(!file.exists("data/Wesolowska-Andersen.xlsx")){
+  download.file("https://ars.els-cdn.com/content/image/1-s2.0-S2666379121003499-mmc6.xlsx", destfile = "data/Wesolowska-Andersen.xlsx")
+}
+## Focus on archetype B
+tab <- readxl::read_excel("data/Wesolowska-Andersen.xlsx", sheet = 6, skip = 2)
+## Process the gene IDs
+tab$GENEID <- gsub("\\.\\d+$", "", tab$Transcript)
+
+## Load our data
+top.x <- topTable(fit2, coef="Post_vs_pre", sort.by = "none", n=Inf)
+## Merge
+myDf <- merge(top.x, tab, by="GENEID") 
+
+## Total least squares regression 
+v <- prcomp(myDf[, c("logFC", "B: estimate")])
+slp <- v$rotation[2,1] / v$rotation[1,1]
+int <- v$center[2] - slp*v$center[1]
+
+## Labeling specific categories of genes
+myDf$highlight <- NA
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 4]] <- "NFKB" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 7]] <- "Neutrophils" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 8]] <- "Erythrocytes" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 12]] <- "Hemoglobin"
+## We add all other hemoglobin subunits
+myDf$highlight[grep("^hemoglobin subunit", myDf$DESCRIPTION)] <- "Hemoglobin" 
+myDf$highlight[grep("^MT-", myDf$SYMBOL)] <- "Mitochondrial" 
+table(myDf$highlight)
+myDf$highlight <- factor(myDf$highlight, levels = c("Neutrophils", "NFKB", "Erythrocytes", "Hemoglobin", "Mitochondrial"))
+myDf <- myDf[order(myDf$highlight), ]
+myDf <- rbind(myDf[is.na(myDf$highlight), ], 
+              myDf[!is.na(myDf$highlight), ])
+
+f6p3 <- ggplot(myDf, aes(x=logFC, y=`B: estimate`)) + 
+  ylab(bquote('Effect size')) +
+  xlab(bquote('log'[2]~'Fold-Change')) +
+  geom_point(aes(color=highlight, alpha=highlight, size=highlight), shape=16) +
+  geom_density_2d(col="grey30") +
+  
+  ## Correlation coefficient
+  stat_cor(label.x = 2.12, label.y = 0.04, aes(label = after_stat(r.label)), size=7, hjust=1) + 
+  ## Regression line slope and intercept 
+  geom_abline(slope=slp, intercept=int, linewidth = 1, color="grey30") +
+
+  ## Fix limits 
+  xlim(c(-2.12, 2.12)) +
+  ylim(c(-0.04, 0.04)) + 
+  scale_color_manual(name="",
+    limits=sort(unique(myDf$highlight)),
+    values=unname(c(myColorNeutro, myColorNfkb, myColorErythro, myColorHemo, myColorMito)),
+    na.value = "grey80") +
+  scale_size_manual(values=c(2,2,2,2,2), guide="none", na.value = 1) +
+  scale_alpha_manual(values=c(1,1,1,1,1), guide="none", na.value = 0.5) +
+  annotate(geom = "text", x=-2.12, y=0, label="T2D archetype B (Wesolowska-Andersen et al.)", angle = 90, size=5, fontface = 'italic') +
+  annotate(geom = "text", x=0, y=-0.04, label="V4 vs. V1 (this study)", size=5, fontface = 'italic') +
+  myTheme 
+f6p3
+```
+
+## de Klerk et al.
+https://link.springer.com/article/10.1007/s00125-023-05886-8
+
+```{r deklerk, fig.width=8, fig.height=7}
+## Download Supp Table of paper
+if(!file.exists("data/deKlerk.xlsx")){
+  download.file("https://static-content.springer.com/esm/art%3A10.1007%2Fs00125-023-05886-8/MediaObjects/125_2023_5886_MOESM2_ESM.xlsx", destfile = "data/deKlerk.xlsx")
+}
+## Genes DE in MOD T2D cluster
+tab <- readxl::read_excel(path="data/deKlerk.xlsx", sheet = 6, range = "O2:T7931")
+
+## Load our data
+top.x <- topTable(fit2, coef="Post_vs_pre", sort.by = "none", n=Inf)
+## Merge
+myDf <- merge(top.x, tab, by.x="SYMBOL", by.y="Gene name") 
+
+## Total least squares regression 
+v <- prcomp(myDf[, c("logFC.x", "logFC.y")])
+slp <- v$rotation[2,1] / v$rotation[1,1]
+int <- v$center[2] - slp*v$center[1]
+
+## Labeling specific categories of genes
+myDf$highlight <- NA
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 4]] <- "NFKB" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 7]] <- "Neutrophils" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 8]] <- "Erythrocytes" 
+myDf$highlight[myDf$SYMBOL %in% stringClusters$protein.name[stringClusters$cluster.number == 12]] <- "Hemoglobin"
+## We add all other hemoglobin subunits
+myDf$highlight[grep("^hemoglobin subunit", myDf$DESCRIPTION)] <- "Hemoglobin" 
+myDf$highlight[grep("^MT-", myDf$SYMBOL)] <- "Mitochondrial" 
+table(myDf$highlight)
+myDf$highlight <- factor(myDf$highlight, levels = c("Neutrophils", "NFKB", "Erythrocytes", "Hemoglobin", "Mitochondrial"))
+myDf <- myDf[order(myDf$highlight), ]
+myDf <- rbind(myDf[is.na(myDf$highlight), ], 
+              myDf[!is.na(myDf$highlight), ])
+
+f6p4 <- ggplot(myDf, aes(x=logFC.x, y=logFC.y)) + 
+  ylab(bquote('log'[2]~'Fold-Change')) +
+  xlab(bquote('log'[2]~'Fold-Change')) +
+  geom_point(aes(color=highlight, alpha=highlight, size=highlight), shape=16) +
+  geom_density_2d(col="grey30") +
+  
+  ## Correlation coefficient
+  stat_cor(label.x = 2.12, label.y = 1, aes(label = after_stat(r.label)), size=7, hjust=1) + 
+  ## Regression line slope and intercept 
+  geom_abline(slope=slp, intercept=int, linewidth = 1, color="grey30") +
+
+  ## Fix limits 
+  xlim(c(-2.12, 2.12)) +
+  ylim(c(-1, 1)) +
+  scale_color_manual(name="",
+    limits=sort(unique(myDf$highlight)),
+    values=unname(c(myColorNeutro, myColorNfkb, myColorErythro, myColorHemo, myColorMito)),
+    na.value = "grey80") +
+  scale_size_manual(values=c(2,2,2,2,2), guide="none", na.value = 1) +
+  scale_alpha_manual(values=c(1,1,1,1,1), guide="none", na.value = 0.5) +
+  annotate(geom = "text", x=-2.12, y=0, label="Mild obesity-related T2D (de Klerk et al.)", angle = 90, size=5, fontface = 'italic') +
+  annotate(geom = "text", x=0, y=-1, label="V4 vs. V1 (this study)", size=5, fontface = 'italic') +
+  myTheme 
+f6p4
+```
+
+
+# Figure 7
+## Liu et al.
+https://www.frontiersin.org/journals/endocrinology/articles/10.3389/fendo.2023.1049484/full
+
+The dataset was downloaded from SRA (BioProject ID PRJNA861382) and reprocessed similar to our dataset (STAR + featureCounts).
+
+```{r liu, fig.width=8, fig.height=7, warning=FALSE}
+dge.liu <- readRDS("data/Liu_DGEList.rds")
+dge.liu$samples
+
+## Filter lowly expressed genes
+keep <- rowSums(edgeR::cpm(dge.liu) > 1) >= 3
+## Exclude LRG loci
+keep <- keep & !dge.liu$genes$GENEBIOTYPE %in% c("LRG_gene")
+sum(keep) 
+dge.liu <- dge.liu[keep, , keep.lib.sizes=FALSE] 
+dge.liu <- calcNormFactors(dge.liu) 
+
+## design matrix 
+moma.liu <- model.matrix(~ 0 + group + Donor, data=dge.liu$samples)
+colnames(moma.liu) <- gsub("group", "", colnames(moma.liu)) 
+
+## Contrast matrix
+contrasts.matrix.liu <- makeContrasts(
+  Post_vs_pre = post - pre,
+  levels=moma.liu
+)
+
+v <- voom(dge.liu, moma.liu, plot=TRUE, normalize.method = "cyclicloess")
+fit <- lmFit(v, moma.liu)
+fit2.liu <- contrasts.fit(fit, contrasts.matrix.liu)
+fit2.liu <- eBayes(fit2.liu, robust=TRUE) 
+table(de <- decideTests(fit2.liu, p.value = 0.05))
+topTable(fit2.liu, coef=1, p.value=0.05, n=10, sort.by = "P")
+
+## Comparison of fold changes ##################################################
+top.x <- topTable(fit2, coef="Post_vs_pre", sort.by = "none", n=Inf)
+top.y <- topTable(fit2.liu, coef="Post_vs_pre", sort.by = "none", n=Inf)
+myDf <- merge(top.x, top.y, by="GENEID") 
+
+## Total least squares regression 
+v <- prcomp(myDf[, c("logFC.x", "logFC.y")])
+slp <- v$rotation[2,1] / v$rotation[1,1]
+int <- v$center[2] - slp*v$center[1]
+eq <- as.expression(substitute(italic(y) == b %.% italic(x) + a, 
+                               list(a = format(unname(int), digits = 2),
+                                    b = format(unname(slp), digits = 2))))
+
+## Labeling specific categories of genes
+myDf$highlight <- NA
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 4]] <- "NFKB" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 7]] <- "Neutrophils" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 8]] <- "Erythrocytes" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 12]] <- "Hemoglobin"
+## We add all other hemoglobin subunits
+myDf$highlight[grep("^hemoglobin subunit", myDf$DESCRIPTION)] <- "Hemoglobin" 
+myDf$highlight[grep("^MT-", myDf$SYMBOL.x)] <- "Mitochondrial" 
+table(myDf$highlight)
+myDf$highlight <- factor(myDf$highlight, levels = c("Neutrophils", "NFKB", "Erythrocytes", "Hemoglobin", "Mitochondrial"))
+myDf <- myDf[order(myDf$highlight), ]
+myDf <- rbind(myDf[is.na(myDf$highlight), ], 
+              myDf[!is.na(myDf$highlight), ])
+
+f7p1 <- ggplot(myDf, aes(x=logFC.x, y=logFC.y)) + 
+  ylab(bquote('log'[2]~'Fold-Change')) +
+  xlab(bquote('log'[2]~'Fold-Change')) +
+  geom_point(aes(color=highlight, alpha=highlight, size=highlight), shape=16) +
+  geom_density_2d(col="grey30") +
+  
+  ## Correlation coefficient
+  stat_cor(label.x = -3.65, label.y = 3.65, aes(label = after_stat(r.label)), size=7, hjust=0) + 
+  ## Regression line slope and intercept 
+  geom_abline(slope=slp, intercept=int, linewidth = 1, color="grey30") +
+  annotate(geom="text", x=-3.65, y=3.65-0.53, 
+           label=eq, parse = TRUE, # See above
+           size=7, hjust=0, vjust=0) +
+
+  ## Fix limits so that range is equal on x and y axes
+  xlim(c(-3.65, 3.65)) +
+  ylim(c(-3.65, 3.65)) +
+  scale_color_manual(name="",
+    limits=sort(unique(myDf$highlight)),
+    values=unname(c(myColorNeutro, myColorNfkb, myColorErythro, myColorHemo, myColorMito)),
+    na.value = "grey80") +
+  scale_size_manual(values=c(2,2,2,2,2), guide="none", na.value = 1) +
+  scale_alpha_manual(values=c(1,1,1,1,1), guide="none", na.value = 0.5) +
+  annotate(geom = "text", x=-3.65, y=0, label="1 month post vs. pre-surgery (Liu et al.)", angle = 90, size=5, fontface = 'italic') +
+  annotate(geom = "text", x=0, y=-3.65, label="V4 vs. V1 (this study)", size=5, fontface = 'italic') +
+  myTheme 
+f7p1
+
+```
+
+## Rashid et al.
+https://academic.oup.com/jes/article/8/1/bvad159/7484625
+
+```{r rashid, fig.width=8, fig.height=7, warning=FALSE}
+## Raw .CEL files are available from GEO under accession GSE271700
+if(!dir.exists("data/GSE271700_RAW/")){
+  download.file("https://ftp.ncbi.nlm.nih.gov/geo/series/GSE271nnn/GSE271700/suppl/GSE271700_RAW.tar", destfile = "data/GSE271700_RAW.tar")
+  untar("data/GSE271700_RAW.tar", exdir = "data/GSE271700_RAW/")
+  file.remove("data/GSE271700_RAW.tar")
+}
+## Read-in and MA normalization
+eset <- justRMA(celfile.path="data/GSE271700_RAW/")
+fData(eset)$GENEID <- AnnotationDbi::mapIds(hgu133plus2.db, keys = row.names(eset), keytype = "PROBEID", column = "ENSEMBL", multiVals = "first")
+fData(eset)$SYMBOL <- AnnotationDbi::mapIds(hgu133plus2.db, keys = row.names(eset), keytype = "PROBEID", column = "SYMBOL", multiVals = "first")
+## Filter out probes without an Ensembl ID
+eset <- eset[!is.na(fData(eset)$GENEID)] 
+## Average expression of probes matching to same Ensembl gene
+eset <- ExpressionSet(assayData = avereps(eset, ID=fData(eset)$GENEID), 
+                      phenoData = phenoData(eset))
+fData(eset)$GENEID <- row.names(eset)
+fData(eset)$SYMBOL <- mapIds(edb, key=row.names(eset), keytype="GENEID", column="SYMBOL")
+fData(eset)$GENENAME <- mapIds(edb, key=row.names(eset), keytype="GENEID", column="DESCRIPTION")
+## Sample info
+pData(eset)$visit <- factor(strsplit2(colnames(eset), split = "_")[, 2])
+pData(eset)$Donor <- factor(strsplit2(colnames(eset), split = "_")[, 3])
+
+## normalization
+exprs(eset) <- normalizeBetweenArrays(exprs(eset), method = "cyclicloess")
+plotDensities(exprs(eset), group = pData(eset)$visit, legend="right")
+
+## DE analysis #################################################################
+## Pre vs. after 2 months
+eset.subset <- eset[, pData(eset)$visit %in% c("T0", "T1")]
+## Remove unpaired donors
+eset.subset <- eset.subset[, pData(eset.subset)$Donor %in% names(which(table(pData(eset.subset)$Donor) == 2))]
+dim(eset.subset) 
+pData(eset.subset)$Donor <- factor(pData(eset.subset)$Donor)
+pData(eset.subset)$visit <- factor(pData(eset.subset)$visit)
+
+## design matrix: for now ignore subgroup
+moma.rashid <- model.matrix(~ 0 + visit + Donor, data=pData(eset.subset))
+colnames(moma.rashid) <- gsub("visit", "", colnames(moma.rashid)) 
+
+## Contrast matrix
+contrasts.matrix.rashid <- makeContrasts(
+  Post_vs_pre = T1 - T0,
+  levels=moma.rashid
+)
+fit <- lmFit(eset.subset, moma.rashid)
+keep <- fit$Amean > 4
+fit2.rashid.2months <- contrasts.fit(fit[keep, ], contrasts.matrix.rashid)
+fit2.rashid.2months <- eBayes(fit2.rashid.2months, trend = TRUE, robust=TRUE) 
+table(de <- decideTests(fit2.rashid.2months, p.value = 0.05))
+# Top genes
+topTable(fit2.rashid.2months, coef=1, p.value=1, n=10, sort.by = "P")
+
+## Same for pre vs. after 1 year ###############################################
+eset.subset <- eset[, pData(eset)$visit %in% c("T0", "T2")]
+## Remove unpaired donors
+eset.subset <- eset.subset[, pData(eset.subset)$Donor %in% names(which(table(pData(eset.subset)$Donor) == 2))]
+dim(eset.subset) 
+pData(eset.subset)$Donor <- factor(pData(eset.subset)$Donor)
+pData(eset.subset)$visit <- factor(pData(eset.subset)$visit)
+
+## design matrix: for now ignore subgroup
+moma.rashid <- model.matrix(~ 0 + visit + Donor, data=pData(eset.subset))
+colnames(moma.rashid) <- gsub("visit", "", colnames(moma.rashid)) 
+
+## Contrast matrix
+contrasts.matrix.rashid <- makeContrasts(
+  Post_vs_pre = T2 - T0,
+  levels=moma.rashid
+)
+fit <- lmFit(eset.subset, moma.rashid)
+keep <- fit$Amean > 4
+fit2.rashid.1year <- contrasts.fit(fit[keep, ], contrasts.matrix.rashid)
+fit2.rashid.1year <- eBayes(fit2.rashid.1year, trend = TRUE, robust=TRUE) 
+table(de <- decideTests(fit2.rashid.1year, p.value = 0.05))
+## but many genes between are DE with an FDR between 5 and 10% 
+table(de <- decideTests(fit2.rashid.1year, p.value = 0.1))
+topTable(fit2.liu, coef=1, p.value=0.1, n=10, sort.by = "P")
+
+## Comparison of fold changes: 2 months ########################################
+top.x <- topTable(fit2, coef="Post_vs_pre", sort.by = "none", n=Inf)
+top.y <- topTable(fit2.rashid.2months, coef="Post_vs_pre", sort.by = "none", n=Inf)
+myDf <- merge(top.x, top.y, by="GENEID") 
+
+## Total least squares regression 
+v <- prcomp(myDf[, c("logFC.x", "logFC.y")])
+slp <- v$rotation[2,1] / v$rotation[1,1]
+int <- v$center[2] - slp*v$center[1]
+eq <- as.expression(substitute(italic(y) == b %.% italic(x) + a, 
+                               list(a = format(unname(int), digits = 2),
+                                    b = format(unname(slp), digits = 2))))
+
+## Labeling specific categories of genes
+myDf$highlight <- NA
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 4]] <- "NFKB" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 7]] <- "Neutrophils" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 8]] <- "Erythrocytes" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 12]] <- "Hemoglobin"
+## We add all other hemoglobin subunits
+myDf$highlight[grep("^hemoglobin subunit", myDf$DESCRIPTION)] <- "Hemoglobin" 
+myDf$highlight[grep("^MT-", myDf$SYMBOL.x)] <- "Mitochondrial" 
+table(myDf$highlight)
+myDf$highlight <- factor(myDf$highlight, levels = c("Neutrophils", "NFKB", "Erythrocytes", "Hemoglobin", "Mitochondrial"))
+myDf <- myDf[order(myDf$highlight), ]
+myDf <- rbind(myDf[is.na(myDf$highlight), ], 
+              myDf[!is.na(myDf$highlight), ])
+
+f7p2 <- ggplot(myDf, aes(x=logFC.x, y=logFC.y)) + 
+  ylab(bquote('log'[2]~'Fold-Change')) +
+  xlab(bquote('log'[2]~'Fold-Change')) +
+  geom_point(aes(color=highlight, alpha=highlight, size=highlight), shape=16) +
+  geom_density_2d(col="grey30") +
+  
+  ## Correlation coefficient
+  stat_cor(label.x = -2.12, label.y = 2.12, aes(label = after_stat(r.label)), size=7, hjust=0) + 
+  ## Regression line slope and intercept 
+  geom_abline(slope=slp, intercept=int, linewidth = 1, color="grey30") +
+  annotate(geom="text", x=-2.12, y=1.8, 
+           label=eq, parse = TRUE, # See above
+           size=7, hjust=0, vjust=0) +
+
+  ## Fix limits so that range is equal on x and y axes
+  xlim(c(-2.12, 2.12)) +
+  ylim(c(-2.12, 2.12)) +
+  scale_color_manual(name="",
+    limits=sort(unique(myDf$highlight)),
+    values=unname(c(myColorNeutro, myColorNfkb, myColorErythro, myColorHemo, myColorMito)),
+    na.value = "grey80") +
+  scale_size_manual(values=c(2,2,2,2,2), guide="none", na.value = 1) +
+  scale_alpha_manual(values=c(1,1,1,1,1), guide="none", na.value = 0.5) +
+  annotate(geom = "text", x=-2.12, y=0, label="2 months post vs. pre-surgery (Rashid et al.)", angle = 90, size=5, fontface = 'italic') +
+  annotate(geom = "text", x=0, y=-2.12, label="V4 vs. V1 (this study)", size=5, fontface = 'italic') +
+  myTheme 
+f7p2
+
+## Comparison of fold changes: 1 year ########################################
+top.x <- topTable(fit2, coef="Post_vs_pre", sort.by = "none", n=Inf)
+top.y <- topTable(fit2.rashid.1year, coef="Post_vs_pre", sort.by = "none", n=Inf)
+myDf <- merge(top.x, top.y, by="GENEID") 
+
+## Total least squares regression 
+v <- prcomp(myDf[, c("logFC.x", "logFC.y")])
+slp <- v$rotation[2,1] / v$rotation[1,1]
+int <- v$center[2] - slp*v$center[1]
+eq <- as.expression(substitute(italic(y) == b %.% italic(x) + a, 
+                               list(a = format(unname(int), digits = 2),
+                                    b = format(unname(slp), digits = 2))))
+
+## Labeling specific categories of genes
+myDf$highlight <- NA
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 4]] <- "NFKB" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 7]] <- "Neutrophils" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 8]] <- "Erythrocytes" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 12]] <- "Hemoglobin"
+## We add all other hemoglobin subunits
+myDf$highlight[grep("^hemoglobin subunit", myDf$DESCRIPTION)] <- "Hemoglobin" 
+myDf$highlight[grep("^MT-", myDf$SYMBOL.x)] <- "Mitochondrial" 
+table(myDf$highlight)
+myDf$highlight <- factor(myDf$highlight, levels = c("Neutrophils", "NFKB", "Erythrocytes", "Hemoglobin", "Mitochondrial"))
+myDf <- myDf[order(myDf$highlight), ]
+myDf <- rbind(myDf[is.na(myDf$highlight), ], 
+              myDf[!is.na(myDf$highlight), ])
+
+f7p4 <- ggplot(myDf, aes(x=logFC.x, y=logFC.y)) + 
+  ylab(bquote('log'[2]~'Fold-Change')) +
+  xlab(bquote('log'[2]~'Fold-Change')) +
+  geom_point(aes(color=highlight, alpha=highlight, size=highlight), shape=16) +
+  geom_density_2d(col="grey30") +
+  
+  ## Correlation coefficient
+  stat_cor(label.x = -2.12, label.y = 2.12, aes(label = after_stat(r.label)), size=7, hjust=0) + 
+  ## Regression line slope and intercept 
+  geom_abline(slope=slp, intercept=int, linewidth = 1, color="grey30") +
+  annotate(geom="text", x=-2.12, y=1.8, 
+           label=eq, parse = TRUE, # See above
+           size=7, hjust=0, vjust=0) +
+
+  ## Fix limits so that range is equal on x and y axes
+  xlim(c(-2.12, 2.12)) +
+  ylim(c(-2.12, 2.12)) +
+  scale_color_manual(name="",
+    limits=sort(unique(myDf$highlight)),
+    values=unname(c(myColorNeutro, myColorNfkb, myColorErythro, myColorHemo, myColorMito)),
+    na.value = "grey80") +
+  scale_size_manual(values=c(2,2,2,2,2), guide="none", na.value = 1) +
+  scale_alpha_manual(values=c(1,1,1,1,1), guide="none", na.value = 0.5) +
+  annotate(geom = "text", x=-2.12, y=0, label="12 months post vs. pre-surgery (Rashid et al.)", angle = 90, size=5, fontface = 'italic') +
+  annotate(geom = "text", x=0, y=-2.12, label="V4 vs. V1 (this study)", size=5, fontface = 'italic') +
+  myTheme 
+f7p4
+```
+
+## Berisha et al.
+https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0016729
+
+```{r berisha, fig.width=8, fig.height=7, warning=FALSE}
+# load series and platform data from GEO
+gset <- getGEO("GSE19790", GSEMatrix =TRUE, AnnotGPL=TRUE)
+gset <- gset[[1]]
+
+## Update the probe annotation: Illumina human-6 v2.0 expression beadchip
+fData(gset)$GENEID <- AnnotationDbi::mapIds(illuminaHumanv2.db, keys = row.names(gset), keytype = "PROBEID", column = "ENSEMBL", multiVals = "first")
+fData(gset)$SYMBOL <- AnnotationDbi::mapIds(illuminaHumanv2.db, keys = row.names(gset), keytype = "PROBEID", column = "SYMBOL", multiVals = "first")
+
+## Sample info
+pData(gset)$group <- factor(gsub("Subject\\s\\d+\\s(pre|post)\\ssurgery" , "\\1", pData(gset)$title))
+pData(gset)$Donor <- factor(gsub("Subject\\s(\\d+)\\s(pre|post)\\ssurgery" , "\\1", pData(gset)$title))
+
+plotDensities(exprs(gset), group = pData(gset)$Donor, legend="right")
+plotDensities(log2(exprs(gset)), group = pData(gset)$Donor, legend="right")
+## Data was quantile normalized already, we simply need to log transform 
+exprs(gset) <- log2(exprs(gset))
+
+## Filter out probes without an Ensembl ID
+gset <- gset[!is.na(fData(gset)$GENEID)] 
+## Average expression of probes matching to same Ensembl ID
+gset <- ExpressionSet(assayData = avereps(gset, ID=fData(gset)$GENEID), 
+                      phenoData = phenoData(gset))
+
+fData(gset)$GENEID <- row.names(gset)
+fData(gset)$SYMBOL <- mapIds(edb, key=row.names(gset), keytype="GENEID", column="SYMBOL")
+fData(gset)$UNIPROT <- mapIds(edb, key=row.names(gset), keytype="GENEID", column="UNIPROTID") 
+fData(gset)$GENENAME <- mapIds(edb, key=row.names(gset), keytype="GENEID", column="DESCRIPTION")
+
+## DE analysis #################################################################
+## design matrix 
+moma.berisha <- model.matrix(~ 0 + group + Donor, data=pData(gset))
+colnames(moma.berisha) <- gsub("group", "", colnames(moma.berisha)) 
+
+## Contrast matrix
+contrasts.matrix.berisha <- makeContrasts(
+  Post_vs_pre = post - pre,
+  levels=moma.berisha
+)
+fit <- lmFit(gset, moma.berisha)
+keep <- fit$Amean > 6.5 # arbitrary filter on expression level
+fit2.berisha <- contrasts.fit(fit[keep, ], contrasts.matrix.berisha)
+fit2.berisha <- eBayes(fit2.berisha, trend = TRUE, robust=TRUE)
+table(de <- decideTests(fit2.berisha, p.value = 0.2)) ## relaxed FDR cutoff here!
+topTable(fit2.berisha)
+
+## Comparison of fold changes ##################################################
+top.x <- topTable(fit2, coef="Post_vs_pre", sort.by = "none", n=Inf)
+top.y <- topTable(fit2.berisha, coef="Post_vs_pre", sort.by = "none", n=Inf)
+myDf <- merge(top.x, top.y, by="GENEID") 
+
+## Total least squares regression 
+v <- prcomp(myDf[, c("logFC.x", "logFC.y")])
+slp <- v$rotation[2,1] / v$rotation[1,1]
+int <- v$center[2] - slp*v$center[1]
+eq <- as.expression(substitute(italic(y) == b %.% italic(x) + a, 
+                               list(a = format(unname(int), digits = 2),
+                                    b = format(unname(slp), digits = 2))))
+
+## Labeling specific categories of genes
+myDf$highlight <- NA
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 4]] <- "NFKB" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 7]] <- "Neutrophils" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 8]] <- "Erythrocytes" 
+myDf$highlight[myDf$SYMBOL.x %in% stringClusters$protein.name[stringClusters$cluster.number == 12]] <- "Hemoglobin"
+## We add all other hemoglobin subunits
+myDf$highlight[grep("^hemoglobin subunit", myDf$DESCRIPTION)] <- "Hemoglobin" 
+myDf$highlight[grep("^MT-", myDf$SYMBOL.x)] <- "Mitochondrial" 
+table(myDf$highlight)
+
+## Sort data frame so that colored points are plotted last
+myDf$highlight <- factor(myDf$highlight, levels = c("Neutrophils", "NFKB", "Erythrocytes", "Hemoglobin", "Mitochondrial"))
+myDf <- myDf[order(myDf$highlight), ]
+myDf <- rbind(myDf[is.na(myDf$highlight), ], 
+              myDf[!is.na(myDf$highlight), ])
+
+f7p3 <- ggplot(myDf, aes(x=logFC.x, y=logFC.y)) + 
+  ylab(bquote('log'[2]~'Fold-Change')) +
+  xlab(bquote('log'[2]~'Fold-Change')) +
+  geom_point(aes(color=highlight, alpha=highlight, size=highlight), shape=16) +
+  geom_density_2d(col="grey30") +
+  
+  ## Correlation coefficient
+  stat_cor(label.x = -2.12, label.y = 2.12, aes(label = after_stat(r.label)), size=7, hjust=0) + 
+  ## Regression line slope and intercept 
+  geom_abline(slope=slp, intercept=int, linewidth = 1, color="grey30") +
+  annotate(geom="text", x=-2.12, y=1.8, 
+           label=eq, parse = TRUE, # See above
+           size=7, hjust=0, vjust=0) +
+
+  ## Fix limits so that range is equal on x and y axes
+  xlim(c(-2.12, 2.12)) +
+  ylim(c(-2.12, 2.12)) +
+  scale_color_manual(name="",
+    limits=sort(unique(myDf$highlight)),
+    values=unname(c(myColorNeutro, myColorNfkb, myColorErythro, myColorHemo, myColorMito)),
+    na.value = "grey80") +
+  scale_size_manual(values=c(2,2,2,2,2), guide="none", na.value = 1) +
+  scale_alpha_manual(values=c(1,1,1,1,1), guide="none", na.value = 0.5) +
+  annotate(geom = "text", x=-2.12, y=0, label="6-12 months post vs. pre-surgery (Berisha et al.)", angle = 90, size=5, fontface = 'italic') +
+  annotate(geom = "text", x=0, y=-2.12, label="V4 vs. V1 (this study)", size=5, fontface = 'italic') +
+  myTheme 
+f7p3
+```
+
